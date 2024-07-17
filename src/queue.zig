@@ -1,13 +1,15 @@
 const std = @import("std");
 const Mutex = std.Thread.Mutex;
 
+const MAX_LOCK_ATTEMPTS = 1000;
+
 pub fn Queue(comptime T: type) type {
     return struct {
         const Self = @This();
         allocator: std.mem.Allocator,
         head: ?*Node,
         tail: ?*Node,
-        mutex: ?*Mutex,
+        mutex: Mutex,
         length: usize,
 
         const Node = struct {
@@ -15,11 +17,10 @@ pub fn Queue(comptime T: type) type {
             next: ?*Node,
         };
 
-        pub fn init(alloc: std.mem.Allocator, mutex: ?*Mutex) Self {
-            _ = mutex;
+        pub fn init(alloc: std.mem.Allocator) Self {
             return Self{
                 .allocator = alloc,
-                .mutex = null,
+                .mutex = Mutex{},
                 .head = null,
                 .tail = null,
                 .length = 0,
@@ -27,6 +28,8 @@ pub fn Queue(comptime T: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            self.mutex.lock();
+
             var current = self.head;
 
             while (current) |node| {
@@ -34,10 +37,15 @@ pub fn Queue(comptime T: type) type {
                 self.allocator.destroy(node);
             }
 
+            self.mutex.unlock();
+
             self.* = undefined;
         }
 
         pub fn enqueue(self: *Self, data: T) !void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
             const node = try self.allocator.create(Node);
             node.* = .{
                 .data = data,
@@ -57,6 +65,9 @@ pub fn Queue(comptime T: type) type {
         }
 
         pub fn dequeue(self: *Self) !T {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
             if (self.head == null or self.head == undefined) {
                 return error.DequeuedEmptyQueue;
             }
@@ -81,17 +92,12 @@ pub fn Queue(comptime T: type) type {
 }
 
 test "can make a queue" {
-    // var mutex: Mutex = .{};
-    const alloc = std.testing.allocator;
-
-    var queue = Queue(u16).init(alloc, null);
+    var queue = Queue(u16).init(std.testing.allocator);
     defer queue.deinit();
 }
 
 test "can dequeue one node" {
-    const alloc = std.testing.allocator;
-
-    var queue = Queue(u16).init(alloc, null);
+    var queue = Queue(u16).init(std.testing.allocator);
     defer queue.deinit();
 
     const uhh1: u16 = 5;
@@ -103,9 +109,7 @@ test "can dequeue one node" {
 }
 
 test "can queue simple data" {
-    const alloc = std.testing.allocator;
-
-    var queue = Queue(u16).init(alloc, null);
+    var queue = Queue(u16).init(std.testing.allocator);
     defer queue.deinit();
 
     const uhh1: u16 = 5;
@@ -117,20 +121,17 @@ test "can queue simple data" {
     try queue.enqueue(uhh3);
 
     const val1 = try queue.dequeue();
-    std.debug.print("Val is {d}\n", .{val1});
     try std.testing.expect(val1 == 5);
+
     const val2 = try queue.dequeue();
-    std.debug.print("Val is {d}\n", .{val2});
     try std.testing.expect(val2 == 10);
+
     const val3 = try queue.dequeue();
-    std.debug.print("Val is {d}\n", .{val2});
     try std.testing.expect(val3 == 3);
 }
 
 test "can empty and refill queue and empty again" {
-    const alloc = std.testing.allocator;
-
-    var queue = Queue(u16).init(alloc, null);
+    var queue = Queue(u16).init(std.testing.allocator);
     defer queue.deinit();
 
     try queue.enqueue(5);
@@ -142,9 +143,7 @@ test "can empty and refill queue and empty again" {
     try std.testing.expect(val1 == 5);
     try std.testing.expect(val2 == 7);
 
-    std.debug.print("Enqueue 4\n", .{});
     try queue.enqueue(4);
-    std.debug.print("Enqueue 8\n", .{});
     try queue.enqueue(8);
 
     const val3 = try queue.dequeue();
@@ -155,9 +154,7 @@ test "can empty and refill queue and empty again" {
 }
 
 test "expect length to be 5 after adding 5 elements" {
-    const alloc = std.testing.allocator;
-
-    var queue = Queue(u16).init(alloc, null);
+    var queue = Queue(u16).init(std.testing.allocator);
     defer queue.deinit();
 
     try queue.enqueue(1);
@@ -170,9 +167,7 @@ test "expect length to be 5 after adding 5 elements" {
 }
 
 test "expect length to be 3 after adding 5 elements and removing 2" {
-    const alloc = std.testing.allocator;
-
-    var queue = Queue(u16).init(alloc, null);
+    var queue = Queue(u16).init(std.testing.allocator);
     defer queue.deinit();
 
     try queue.enqueue(1);
@@ -185,4 +180,53 @@ test "expect length to be 3 after adding 5 elements and removing 2" {
     _ = try queue.dequeue();
 
     try std.testing.expect(queue.length == 3);
+}
+
+test "multiple threads can access the queue" {
+    const ThreadContext = struct {
+        queue: *Queue(u32),
+        start_value: u32,
+        count: u32,
+    };
+
+    const thread_count = 4;
+    const operations_per_thread = 1000;
+
+    var queue = Queue(u32).init(std.testing.allocator);
+    defer queue.deinit();
+
+    var threads: [thread_count]std.Thread = undefined;
+    var contexts: [thread_count]ThreadContext = undefined;
+
+    const Runner = struct {
+        fn run(context: *ThreadContext) void {
+            var i: u32 = 0;
+            while (i < context.count) : (i += 1) {
+                const value: u32 = @intCast(context.start_value + i);
+                context.queue.enqueue(value) catch unreachable;
+            }
+
+            i = 0;
+            while (i < context.count) : (i += 1) {
+                _ = context.queue.dequeue() catch unreachable;
+            }
+        }
+    };
+
+    for (&threads, 0..) |*thread, i| {
+        contexts[i] = ThreadContext{
+            .queue = &queue,
+            .start_value = @intCast(i * operations_per_thread),
+            .count = operations_per_thread,
+        };
+
+        thread.* = try std.Thread.spawn(.{}, Runner.run, .{&contexts[i]});
+    }
+
+    for (threads) |thread| {
+        thread.join();
+    }
+
+    try std.testing.expectEqual(0, queue.length);
+    try std.testing.expectError(error.DequeuedEmptyQueue, queue.dequeue());
 }
