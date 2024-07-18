@@ -1,8 +1,6 @@
 const std = @import("std");
 const Mutex = std.Thread.Mutex;
 
-const MAX_LOCK_ATTEMPTS = 1000;
-
 pub fn Queue(comptime T: type) type {
     return struct {
         const Self = @This();
@@ -87,6 +85,15 @@ pub fn Queue(comptime T: type) type {
             self.length -= 1;
 
             return data;
+        }
+
+        pub fn peek(self: *Self) !?T {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            if (self.head == null) return null;
+
+            return self.head.?.data;
         }
     };
 }
@@ -180,6 +187,27 @@ test "expect length to be 3 after adding 5 elements and removing 2" {
     _ = try queue.dequeue();
 
     try std.testing.expect(queue.length == 3);
+}
+
+test "can peek in the queue" {
+    var queue = Queue(u16).init(std.testing.allocator);
+    defer queue.deinit();
+
+    try queue.enqueue(1);
+    try queue.enqueue(2);
+    try queue.enqueue(3);
+    try queue.enqueue(4);
+    try queue.enqueue(5);
+
+    const peeked_val = try queue.peek();
+
+    try std.testing.expect(peeked_val == 1);
+
+    _ = try queue.dequeue();
+
+    const peek_again = try queue.peek();
+
+    try std.testing.expect(peek_again == 2);
 }
 
 test "multiple threads can access the queue" {
